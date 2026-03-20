@@ -35,7 +35,7 @@ from .discovery import (
     DiscoveryConfig, NodeInfo,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.1.2"
 
 
 class VecGrid:

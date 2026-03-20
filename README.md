@@ -210,8 +210,6 @@ If you need higher recall, you have two levers:
 
 **Single-writer per partition.** The primary node for a partition handles all writes. There's no multi-master replication. At very high write throughput, the primary can become a bottleneck.
 
-**No filtered search push-down (yet).** Metadata filtering happens after HNSW search, not during. This means if you search with a tight filter, you may get fewer than k results. A future version should push filters into the HNSW traversal.
-
 ---
 
 ## Quick Start

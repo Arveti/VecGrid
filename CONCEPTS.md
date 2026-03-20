@@ -991,4 +991,4 @@ Step 5: BACK TO NORMAL
 
 ---
 
-*This document covers VecGrid v0.0.1. See the [README](README.md) for quick-start guides and API reference.*
+*This document covers VecGrid v0.1.2. See the [README](README.md) for quick-start guides and API reference.*
