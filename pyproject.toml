@@ -53,7 +53,7 @@ dev = [
 [project.urls]
 Homepage = "https://github.com/Arveti/VecGrid"
 Documentation = "https://github.com/Arveti/VecGrid#readme"
-Repository = "https://github.com/Arveti/VecGrid/vecgrid"
+Repository = "https://github.com/Arveti/VecGrid"
 Issues = "https://github.com/Arveti/VecGrid/issues"
 
 [tool.hatch.build.targets.wheel]
