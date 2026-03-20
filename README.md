@@ -322,7 +322,7 @@ grid.start()  # Snapshot + WAL replay → all data restored
 | Heartbeat failure detector | ✅ Done | Auto-detects crashed nodes |
 | TCP transport | ✅ Done | Length-prefixed JSON protocol |
 | In-process transport | ✅ Done | For embedded / testing mode |
-| Filtered search push-down | ❌ Planned | Currently post-filter only |
+| Filtered search push-down | ✅ Done |
 | GPU distance computation | ❌ Planned | Currently CPU numpy |
 | gRPC transport | ❌ Planned | Currently custom TCP |
 | TLS / authentication | ❌ Planned | Currently plaintext |

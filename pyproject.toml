@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vecgrid"
-version = "0.1.0"
+version = "0.1.1"
 description = "Distributed embedded vector database — like Hazelcast, but for vector search. Python-native."
 readme = "README.md"
 license = "GPL-3.0-or-later"
