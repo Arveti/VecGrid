@@ -584,13 +584,18 @@ class EmbeddedNode:
 
     def _handle_search(self, msg: Message) -> Message:
         """Search all LOCAL primary partitions only (no backup double-counting)."""
+        from .hnsw import compile_filter
+
         payload = msg.payload
         query = payload["query"]
         k = payload.get("k", 10)
         ef = payload.get("ef")
+        filter_spec = payload.get("filter")
 
         if isinstance(query, list):
             query = np.array(query, dtype=np.float32)
+
+        compiled_filter = compile_filter(filter_spec)
 
         # Snapshot partition references under lock, search outside it
         with self._lock:
@@ -600,7 +605,8 @@ class EmbeddedNode:
         all_results = []
         for pid, lp in to_search:
             try:
-                results = lp.index.search(query, k=k, ef=ef)
+                results = lp.index.search(query, k=k, ef=ef,
+                                          filter_fn=compiled_filter)
                 for dist, vid, meta in results:
                     all_results.append({
                         "distance": dist,
@@ -830,15 +836,40 @@ class EmbeddedNode:
             raise RuntimeError("No owner for partition — cluster may be empty")
 
     def search(self, query: np.ndarray, k: int = 10,
-               ef: Optional[int] = None) -> list[SearchResult]:
+               ef: Optional[int] = None,
+               filter: Optional = None) -> list[SearchResult]:
         """
         Scatter-gather search across all nodes.
-        Only primary partitions are searched to avoid double-counting.
+
+        Args:
+            filter: Metadata filter. Either:
+                - Dict spec: {"field": "source", "op": "eq", "value": "Biology"}
+                - List of specs (AND): [spec1, spec2, ...]
+                - Callable(meta) -> bool (single-node only)
         """
+        from .hnsw import compile_filter
+
         if query.shape != (self.config.dim,):
             raise ValueError(f"Expected dim {self.config.dim}, got {query.shape}")
         if k < 1:
             raise ValueError(f"k must be >= 1, got {k}")
+
+        # Determine if filter is serializable or callable-only
+        filter_spec = None
+        compiled_filter = None
+
+        if filter is not None:
+            if callable(filter) and not isinstance(filter, (dict, list)):
+                if len(self._cluster_nodes) > 1:
+                    raise ValueError(
+                        "Callable filters cannot be used in distributed mode. "
+                        "Use a filter spec dict/list instead: "
+                        '{"field": "name", "op": "eq", "value": "x"}'
+                    )
+                compiled_filter = filter
+            else:
+                filter_spec = filter
+                compiled_filter = compile_filter(filter)
 
         all_results = []
 
@@ -849,7 +880,8 @@ class EmbeddedNode:
 
         for pid, lp in to_search:
             try:
-                results = lp.index.search(query, k=k, ef=ef)
+                results = lp.index.search(query, k=k, ef=ef,
+                                          filter_fn=compiled_filter)
                 for dist, vid, meta in results:
                     all_results.append(SearchResult(
                         vector_id=vid,
@@ -862,10 +894,14 @@ class EmbeddedNode:
                 logger.warning(f"Search failed on partition {pid}: {e}")
 
         # Scatter to remote nodes
+        search_payload = {"query": query, "k": k, "ef": ef}
+        if filter_spec is not None:
+            search_payload["filter"] = filter_spec
+
         search_msg = Message(
             msg_type="search",
             sender=self.node_id,
-            payload={"query": query, "k": k, "ef": ef},
+            payload=search_payload,
         )
         responses = self.transport.broadcast(search_msg)
         for resp in responses:

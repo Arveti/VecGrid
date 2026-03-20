@@ -1,4 +1,7 @@
-import time, numpy as np
+import sys, os, time
+import numpy as np
+# Ensure we import the local vecgrid, not a globally installed outdated one
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from vecgrid import VecGrid
 
 print('=== Node 1 (seed node) ===')
@@ -11,8 +14,9 @@ print(f'Cluster: {sorted(grid._node._cluster_nodes)}')
 
 # Insert some data
 np.random.seed(42)
+categories = ["Internal", "Public"]
 for i in range(100):
-    grid.put(f'vec-{i}', np.random.randn(32).astype(np.float32), {'i': i})
+    grid.put(f'vec-{i}', np.random.randn(32).astype(np.float32), {'i': i, 'access': categories[i % 2]})
 print(f'Inserted 100 vectors')
 
 # Wait for other node to join
@@ -33,8 +37,14 @@ print(f'Local: {grid.local_size()} primary, {grid.local_backup_size()} backup')
 
 # Search
 query = np.random.randn(32).astype(np.float32)
+print("--- Simple Search ---")
 results = grid.search(query, k=5)
-print(f'Search: {[r.vector_id for r in results]}')
+print(f'Unfiltered results: {[r.vector_id for r in results]}')
+
+print("--- Pushdown Filtered Search ('access' == 'Public') ---")
+f_spec = {"field": "access", "op": "eq", "value": "Public"}
+results_filtered = grid.search(query, k=5, filter=f_spec)
+print(f'Filtered results: {[r.vector_id for r in results_filtered]}')
 
 time.sleep(10) # Wait for terminal 2 to finish
 

@@ -23,6 +23,68 @@ import numpy as np
 logger = logging.getLogger("vecgrid.hnsw")
 
 # ---------------------------------------------------------------------------
+# Filter compilation
+# ---------------------------------------------------------------------------
+
+FilterFn = Callable[[dict], bool]
+
+_FILTER_OPS = {
+    "eq":  lambda field_val, val: field_val == val,
+    "ne":  lambda field_val, val: field_val != val,
+    "gt":  lambda field_val, val: field_val > val,
+    "gte": lambda field_val, val: field_val >= val,
+    "lt":  lambda field_val, val: field_val < val,
+    "lte": lambda field_val, val: field_val <= val,
+    "in":  lambda field_val, val: field_val in val,
+}
+
+
+def compile_filter(filter_spec) -> Optional[FilterFn]:
+    """
+    Compile a filter spec into a callable(metadata_dict) -> bool.
+
+    Formats:
+        {"field": "source", "op": "eq", "value": "Biology"}
+        [{"field": ..., "op": ..., "value": ...}, ...]   (AND)
+        callable(meta) -> bool                            (passthrough)
+        None                                              (no filter)
+    """
+    if filter_spec is None:
+        return None
+    if callable(filter_spec):
+        return filter_spec
+    if isinstance(filter_spec, dict):
+        conditions = [filter_spec]
+    elif isinstance(filter_spec, list):
+        conditions = filter_spec
+    else:
+        raise ValueError(f"Invalid filter spec type: {type(filter_spec)}")
+
+    compiled = []
+    for cond in conditions:
+        field = cond.get("field")
+        op_name = cond.get("op")
+        value = cond.get("value")
+        if not field or not op_name:
+            raise ValueError(f"Filter must have 'field' and 'op': {cond}")
+        op_fn = _FILTER_OPS.get(op_name)
+        if op_fn is None:
+            raise ValueError(f"Unknown op '{op_name}'. Supported: {list(_FILTER_OPS.keys())}")
+        compiled.append((field, op_fn, value))
+
+    def _filter(meta: dict) -> bool:
+        for field, op_fn, value in compiled:
+            field_val = meta.get(field)
+            if field_val is None:
+                return False
+            if not op_fn(field_val, value):
+                return False
+        return True
+
+    return _filter
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -185,6 +247,8 @@ class HNSWLibIndex(HNSWIndex):
         if ef:
             self._index.set_ef(ef)
 
+        compiled_filter = compile_filter(filter_fn)
+
         # Clamp fetch_k to actual index element count to avoid hnswlib
         # "Cannot return the results in a contiguous 2D array" error.
         index_count = self._index.get_current_count()
@@ -193,7 +257,12 @@ class HNSWLibIndex(HNSWIndex):
         active_count = index_count - len(self._deleted)
         if active_count <= 0:
             return []
-        fetch_k = min(k * 3 + len(self._deleted), index_count)
+
+        # Increase fetch_k when filtering to compensate
+        if compiled_filter is not None:
+            fetch_k = min(k * 5 + len(self._deleted), index_count)
+        else:
+            fetch_k = min(k * 3 + len(self._deleted), index_count)
         fetch_k = min(fetch_k, active_count)
         fetch_k = max(1, fetch_k)
 
@@ -202,10 +271,31 @@ class HNSWLibIndex(HNSWIndex):
         if fetch_k > (ef or prev_ef):
             self._index.set_ef(fetch_k)
 
+        # Build hnswlib-native filter if available
+        hnswlib_filter = None
+        if compiled_filter is not None:
+            def hnswlib_filter(label):
+                str_id = self._int_to_str.get(int(label))
+                if str_id is None or str_id in self._deleted:
+                    return False
+                meta = self._metadata.get(str_id, {})
+                return compiled_filter(meta)
+
         try:
+            knn_kwargs = {"k": fetch_k}
+            if hnswlib_filter is not None:
+                knn_kwargs["filter"] = hnswlib_filter
             labels, distances = self._index.knn_query(
-                query.reshape(1, -1).astype(np.float32), k=fetch_k
+                query.reshape(1, -1).astype(np.float32), **knn_kwargs
             )
+        except TypeError:
+            # Older hnswlib without filter support — fall back to post-filter
+            if "filter" in knn_kwargs:
+                del knn_kwargs["filter"]
+                labels, distances = self._index.knn_query(
+                    query.reshape(1, -1).astype(np.float32), **knn_kwargs
+                )
+                hnswlib_filter = None  # Signal post-filter needed
         except RuntimeError:
             # Fallback: try with exactly active_count
             fetch_k = max(1, active_count)
@@ -213,6 +303,7 @@ class HNSWLibIndex(HNSWIndex):
             labels, distances = self._index.knn_query(
                 query.reshape(1, -1).astype(np.float32), k=fetch_k
             )
+            hnswlib_filter = None  # Post-filter needed
 
         results = []
         for dist, int_id in zip(distances[0], labels[0]):
@@ -222,7 +313,8 @@ class HNSWLibIndex(HNSWIndex):
             if str_id is None or str_id in self._deleted:
                 continue
             meta = self._metadata.get(str_id, {})
-            if filter_fn and not filter_fn(meta):
+            # Post-filter only if hnswlib native filter wasn't used
+            if hnswlib_filter is None and compiled_filter and not compiled_filter(meta):
                 continue
             results.append((float(dist), str_id, meta))
             if len(results) >= k:
@@ -359,51 +451,64 @@ class NumpyHNSWIndex(HNSWIndex):
         return self._pair_dist_fn(self._vectors_dict[a], self._vectors_dict[b])
 
     def _search_layer(self, query: np.ndarray, entry_points: list[str],
-                      ef: int, layer: int) -> list[tuple[float, str]]:
-        """Beam search on a single layer. Returns sorted (distance, id) pairs."""
+                      ef: int, layer: int,
+                      filter_fn: Optional[FilterFn] = None
+                      ) -> list[tuple[float, str]]:
+        """Beam search on a single layer. Returns sorted (distance, id) pairs.
+
+        If filter_fn is provided, ALL nodes are still traversed for graph
+        connectivity, but only matching nodes are included in results.
+        """
         visited = set(entry_points)
-        candidates = []  # min-heap
-        results = []     # max-heap (negated)
+        candidates = []  # min-heap: all nodes (for traversal)
+        results = []     # max-heap (negated): only matching nodes
 
         for ep in entry_points:
             dist = self._dist_to_query(query, ep)
             heapq.heappush(candidates, (dist, ep))
-            heapq.heappush(results, (-dist, ep))
+            if filter_fn is None or filter_fn(self._metadata_dict.get(ep, {})):
+                heapq.heappush(results, (-dist, ep))
 
         while candidates:
             c_dist, c_id = heapq.heappop(candidates)
-            f_dist = -results[0][0]
-            if c_dist > f_dist:
-                break
+            # Stop only when results heap is full and candidate is worse
+            if results and len(results) >= ef:
+                f_dist = -results[0][0]
+                if c_dist > f_dist:
+                    break
 
             neighbors = self._graphs[layer].get(c_id, set())
-            # Batch distance computation for unvisited neighbors
             unvisited = [n for n in neighbors if n not in visited]
             if not unvisited:
                 continue
             visited.update(unvisited)
 
             if len(unvisited) > 4:
-                # Vectorized batch distance
                 vecs = np.array([self._vectors_dict[n] for n in unvisited])
                 dists = self._dist_fn(query, vecs)
                 for n_id, n_dist in zip(unvisited, dists):
                     n_dist = float(n_dist)
-                    f_dist = -results[0][0]
-                    if n_dist < f_dist or len(results) < ef:
-                        heapq.heappush(candidates, (n_dist, n_id))
-                        heapq.heappush(results, (-n_dist, n_id))
-                        if len(results) > ef:
-                            heapq.heappop(results)
+                    # Always add to candidates for graph traversal
+                    heapq.heappush(candidates, (n_dist, n_id))
+                    # Only add to results if passes filter
+                    if filter_fn is None or filter_fn(self._metadata_dict.get(n_id, {})):
+                        if not results or len(results) < ef:
+                            heapq.heappush(results, (-n_dist, n_id))
+                        elif n_dist < -results[0][0]:
+                            heapq.heappush(results, (-n_dist, n_id))
+                            if len(results) > ef:
+                                heapq.heappop(results)
             else:
                 for n_id in unvisited:
                     n_dist = self._dist_to_query(query, n_id)
-                    f_dist = -results[0][0]
-                    if n_dist < f_dist or len(results) < ef:
-                        heapq.heappush(candidates, (n_dist, n_id))
-                        heapq.heappush(results, (-n_dist, n_id))
-                        if len(results) > ef:
-                            heapq.heappop(results)
+                    heapq.heappush(candidates, (n_dist, n_id))
+                    if filter_fn is None or filter_fn(self._metadata_dict.get(n_id, {})):
+                        if not results or len(results) < ef:
+                            heapq.heappush(results, (-n_dist, n_id))
+                        elif n_dist < -results[0][0]:
+                            heapq.heappush(results, (-n_dist, n_id))
+                            if len(results) > ef:
+                                heapq.heappop(results)
 
         return sorted([(-d, nid) for d, nid in results])
 
@@ -532,23 +637,29 @@ class NumpyHNSWIndex(HNSWIndex):
         if self._needs_normalize:
             q = self._normalize(q)
 
+        compiled_filter = compile_filter(filter_fn)
+
         ef = ef or self.config.ef_search
+        # Boost ef when filtering to compensate for filtered-out candidates
+        if compiled_filter is not None:
+            ef = max(ef, k * 4)
         ef = max(ef, k)
         ep = self._entry_point
 
+        # Greedy descent on upper layers (no filter — just finding entry point)
         for level in range(self._max_level, 0, -1):
             if ep in self._graphs[level]:
                 results = self._search_layer(q, [ep], ef=1, layer=level)
                 if results:
                     ep = results[0][1]
 
-        results = self._search_layer(q, [ep], ef=ef, layer=0)
+        # Layer 0 search with filter pushdown
+        results = self._search_layer(q, [ep], ef=ef, layer=0,
+                                     filter_fn=compiled_filter)
 
         final = []
         for dist, nid in results:
             meta = self._metadata_dict.get(nid, {})
-            if filter_fn and not filter_fn(meta):
-                continue
             final.append((dist, nid, meta))
             if len(final) >= k:
                 break

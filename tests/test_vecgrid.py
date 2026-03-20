@@ -10,6 +10,31 @@ import shutil
 import tempfile
 import numpy as np
 
+def compute_exact_knn(query, vectors_dict, k, metric="cosine", metadatas_dict=None, filter_ext=None):
+    from vecgrid.hnsw import compile_filter
+    filter_fn = compile_filter(filter_ext)
+    
+    candidates = []
+    for vid, vec in vectors_dict.items():
+        if filter_fn is not None:
+            meta = metadatas_dict.get(vid, {}) if metadatas_dict else {}
+            if not filter_fn(meta):
+                continue
+                
+        if metric == "cosine":
+            norm_q = float(np.linalg.norm(query))
+            norm_v = float(np.linalg.norm(vec))
+            if norm_q > 0 and norm_v > 0:
+                dist = 1.0 - float(np.dot(query, vec) / (norm_q * norm_v))
+            else:
+                dist = 1.0
+        else:
+            dist = float(np.linalg.norm(query - vec))
+        candidates.append((dist, vid))
+        
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return [vid for dist, vid in candidates[:k]]
+
 try:
     import pytest
     HAS_PYTEST = True
@@ -35,7 +60,7 @@ class _raises:
         return False
 
 
-# ---------------------------------------------------------------- ----------------------------------------------------------------
+# ----------------------------------------------------------------
 # HNSW + Single Node
 # ----------------------------------------------------------------
 
@@ -43,16 +68,18 @@ class TestSingleNode:
     def test_insert_and_search(self):
         with VecGrid("solo", dim=32) as grid:
             np.random.seed(1)
+            vectors = {}
             for i in range(100):
                 vec = np.random.randn(32).astype(np.float32)
                 grid.put(f"v-{i}", vec, {"i": i})
+                vectors[f"v-{i}"] = vec
 
             query = np.random.randn(32).astype(np.float32)
             results = grid.search(query, k=5)
             assert len(results) == 5
-            # Distances should be sorted
-            dists = [r.distance for r in results]
-            assert dists == sorted(dists)
+            
+            exact_ids = compute_exact_knn(query, vectors, k=5)
+            assert [r.vector_id for r in results] == exact_ids
 
     def test_delete(self):
         with VecGrid("solo", dim=16) as grid:
@@ -89,9 +116,11 @@ class TestCluster:
         nodes = [VecGrid(f"n-{i}", dim=32).start() for i in range(3)]
         np.random.seed(10)
 
+        vectors = {}
         for i in range(300):
             vec = np.random.randn(32).astype(np.float32)
             nodes[0].put(f"v-{i}", vec)
+            vectors[f"v-{i}"] = vec
 
         total = sum(n.local_size() for n in nodes)
         assert total == 300
@@ -101,6 +130,9 @@ class TestCluster:
         r1 = [r.vector_id for r in nodes[1].search(query, k=10)]
         r2 = [r.vector_id for r in nodes[2].search(query, k=10)]
         assert r0 == r1 == r2  # Consistency
+        
+        exact_ids = compute_exact_knn(query, vectors, k=10)
+        assert r0 == exact_ids
 
         for n in nodes:
             n.stop()
@@ -204,6 +236,163 @@ class TestMigration:
 
         size_after = nodes[0].cluster_size()
         assert size_after == 300  # No data loss
+
+        for n in nodes:
+            n.stop()
+
+
+# ----------------------------------------------------------------
+# Filtered Search (Predicate Pushdown)
+# ----------------------------------------------------------------
+
+class TestFilteredSearch:
+    """Test predicate pushdown / filter-aware search."""
+
+    def _make_grid(self):
+        grid = VecGrid("solo", dim=16, num_partitions=7)
+        grid.start()
+        np.random.seed(42)
+        categories = ["Biology", "Physics", "Math", "History"]
+        self.vectors = {}
+        self.metadatas = {}
+        for i in range(200):
+            vec = np.random.randn(16).astype(np.float32)
+            meta = {
+                "category": categories[i % 4],
+                "year": 2018 + (i % 6),
+                "score": float(i),
+            }
+            grid.put(f"v-{i}", vec, meta)
+            self.vectors[f"v-{i}"] = vec
+            self.metadatas[f"v-{i}"] = meta
+        return grid
+
+    def test_eq_filter(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = {"field": "category", "op": "eq", "value": "Biology"}
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_ne_filter(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = {"field": "category", "op": "ne", "value": "History"}
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_in_filter(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = {"field": "category", "op": "in", "value": ["Biology", "Physics"]}
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_gt_filter(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = {"field": "year", "op": "gt", "value": 2020}
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_gte_lte_filter(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+
+        f_spec_gte = {"field": "year", "op": "gte", "value": 2021}
+        results_gte = grid.search(query, k=10, filter=f_spec_gte)
+        exact_ids_gte = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec_gte)
+        assert [r.vector_id for r in results_gte] == exact_ids_gte
+
+        f_spec_lte = {"field": "year", "op": "lte", "value": 2019}
+        results_lte = grid.search(query, k=10, filter=f_spec_lte)
+        exact_ids_lte = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec_lte)
+        assert [r.vector_id for r in results_lte] == exact_ids_lte
+
+        grid.stop()
+
+    def test_lt_filter(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = {"field": "year", "op": "lt", "value": 2020}
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_and_conditions(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = [
+            {"field": "category", "op": "eq", "value": "Biology"},
+            {"field": "year", "op": "gt", "value": 2020},
+        ]
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_no_matches_returns_empty(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        results = grid.search(query, k=10,
+                              filter={"field": "category", "op": "eq",
+                                      "value": "Nonexistent"})
+        assert len(results) == 0
+        grid.stop()
+
+    def test_no_filter_backward_compat(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        results = grid.search(query, k=10)
+        assert len(results) == 10
+        exact_ids = compute_exact_knn(query, self.vectors, k=10)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_callable_filter_local(self):
+        grid = self._make_grid()
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = lambda meta: meta.get("category") == "Math"
+        results = grid.search(query, k=10, filter=f_spec)
+        exact_ids = compute_exact_knn(query, self.vectors, k=10, metadatas_dict=self.metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+        grid.stop()
+
+    def test_filtered_search_cluster(self):
+        nodes = [VecGrid(f"n-{i}", dim=16, num_partitions=7).start()
+                 for i in range(3)]
+        np.random.seed(10)
+        categories = ["A", "B", "C"]
+        vectors = {}
+        metadatas = {}
+        for i in range(300):
+            vec = np.random.randn(16).astype(np.float32)
+            meta = {"cat": categories[i % 3]}
+            nodes[0].put(f"v-{i}", vec, meta)
+            vectors[f"v-{i}"] = vec
+            metadatas[f"v-{i}"] = meta
+
+        query = np.random.randn(16).astype(np.float32)
+        f_spec = {"field": "cat", "op": "eq", "value": "A"}
+        results = nodes[0].search(query, k=10, filter=f_spec)
+        assert len(results) > 0
+        
+        exact_ids = compute_exact_knn(query, vectors, k=10, metadatas_dict=metadatas, filter_ext=f_spec)
+        assert [r.vector_id for r in results] == exact_ids
+
+        # All nodes should return same filtered results
+        r1 = [r.vector_id for r in nodes[1].search(query, k=10, filter=f_spec)]
+        r2 = [r.vector_id for r in nodes[2].search(query, k=10, filter=f_spec)]
+        assert r1 == exact_ids and r2 == exact_ids
 
         for n in nodes:
             n.stop()
@@ -419,7 +608,7 @@ if __name__ == "__main__":
 
     test_classes = [
         TestSingleNode, TestCluster, TestReplication,
-        TestSmartRouting, TestMigration,
+        TestSmartRouting, TestMigration, TestFilteredSearch,
         TestWAL, TestSnapshot, TestPersistenceRecovery,
     ]
 

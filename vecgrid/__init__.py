@@ -25,7 +25,7 @@ Usage (TCP with seed node discovery):
 
 from typing import Optional
 
-from .hnsw import HNSWIndex, HNSWConfig, NumpyHNSWIndex, create_index, get_backend_name
+from .hnsw import HNSWIndex, HNSWConfig, NumpyHNSWIndex, create_index, get_backend_name, compile_filter
 from .hash_ring import ConsistentHashRing
 from .node import EmbeddedNode, VecGridConfig, SearchResult, PartitionRole, LocalPartition
 from .transport import InProcessTransport, TCPTransport, Transport, Message
@@ -241,12 +241,23 @@ class VecGrid:
             vector = np.array(vector, dtype=np.float32)
         self._node.put(vector_id, vector, metadata)
 
-    def search(self, query, k: int = 10, ef: Optional[int] = None) -> list[SearchResult]:
-        """Search for k nearest neighbors across the cluster."""
+    def search(self, query, k: int = 10, ef: Optional[int] = None,
+               filter: Optional = None) -> list[SearchResult]:
+        """Search for k nearest neighbors across the cluster.
+
+        Args:
+            query: Query vector (numpy array or list).
+            k: Number of results to return.
+            ef: HNSW search beam width override.
+            filter: Metadata filter. Either:
+                - Dict spec: {"field": "source", "op": "eq", "value": "Biology"}
+                - List of specs (AND): [spec1, spec2, ...]
+                - Callable(meta) -> bool (single-node only)
+        """
         import numpy as np
         if not isinstance(query, np.ndarray):
             query = np.array(query, dtype=np.float32)
-        return self._node.search(query, k=k, ef=ef)
+        return self._node.search(query, k=k, ef=ef, filter=filter)
 
     def delete(self, vector_id: str) -> bool:
         """Delete a vector by ID."""

@@ -436,8 +436,8 @@ vecgrid/
 │   ├── conftest.py          # Pytest fixtures (transport reset, tmp_dir)
 │   ├── test_vecgrid.py      # 19 automated tests
 │   ├── test_demo_qa.py      # Semantic QA integration test
-│   ├── test10_terminal1.py  # Multi-process TCP test (terminal 1)
-│   └── test10_terminal2.py  # Multi-process TCP test (terminal 2)
+│   ├── test_terminal1.py  # Multi-process TCP test (terminal 1)
+│   └── test_terminal2.py  # Multi-process TCP test (terminal 2)
 ├── benchmark.py             # Performance benchmark suite
 ├── demo.py                  # 6 interactive demos
 ├── BENCHMARKS.md            # Performance numbers and analysis
