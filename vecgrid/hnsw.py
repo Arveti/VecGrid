@@ -185,18 +185,34 @@ class HNSWLibIndex(HNSWIndex):
         if ef:
             self._index.set_ef(ef)
 
-        # Over-fetch to account for deleted items and filtering.
-        # Clamp to actual hnswlib element count (includes marked-deleted)
-        # to avoid "Cannot return the results in a contiguous 2D array".
+        # Clamp fetch_k to actual index element count to avoid hnswlib
+        # "Cannot return the results in a contiguous 2D array" error.
         index_count = self._index.get_current_count()
         if index_count == 0:
             return []
+        active_count = index_count - len(self._deleted)
+        if active_count <= 0:
+            return []
         fetch_k = min(k * 3 + len(self._deleted), index_count)
-        fetch_k = max(fetch_k, min(k, index_count))
+        fetch_k = min(fetch_k, active_count)
+        fetch_k = max(1, fetch_k)
 
-        labels, distances = self._index.knn_query(
-            query.reshape(1, -1).astype(np.float32), k=fetch_k
-        )
+        # hnswlib requires ef >= k for the query
+        prev_ef = self.config.ef_search
+        if fetch_k > (ef or prev_ef):
+            self._index.set_ef(fetch_k)
+
+        try:
+            labels, distances = self._index.knn_query(
+                query.reshape(1, -1).astype(np.float32), k=fetch_k
+            )
+        except RuntimeError:
+            # Fallback: try with exactly active_count
+            fetch_k = max(1, active_count)
+            self._index.set_ef(max(fetch_k, ef or prev_ef))
+            labels, distances = self._index.knn_query(
+                query.reshape(1, -1).astype(np.float32), k=fetch_k
+            )
 
         results = []
         for dist, int_id in zip(distances[0], labels[0]):
@@ -212,8 +228,8 @@ class HNSWLibIndex(HNSWIndex):
             if len(results) >= k:
                 break
 
-        if ef:
-            self._index.set_ef(self.config.ef_search)
+        # Always restore ef to default
+        self._index.set_ef(self.config.ef_search)
 
         return results
 
