@@ -155,9 +155,11 @@ class TCPTransport(Transport):
     - Auto peer registration on discovery
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 0):
+    def __init__(self, host: str = "0.0.0.0", port: int = 0,
+                 advertise_host: Optional[str] = None):
         self.host = host
         self.port = port
+        self.advertise_host = advertise_host or self._resolve_advertise_host()
         self._node_id: Optional[str] = None
         self._handler: Optional[Callable] = None
         self._server_socket: Optional[socket.socket] = None
@@ -165,6 +167,18 @@ class TCPTransport(Transport):
         self._thread: Optional[threading.Thread] = None
         self._peers: dict[str, tuple[str, int]] = {}  # node_id -> (host, port)
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _resolve_advertise_host() -> str:
+        """Auto-detect the reachable IP of this machine."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
+        finally:
+            s.close()
 
     def register_peer(self, node_id: str, host: str, port: int):
         """Register a peer node's address."""
@@ -252,7 +266,7 @@ class TCPTransport(Transport):
 
     def _handle_discovery_request(self, conn: socket.socket, request: dict):
         """Respond with current member list including ourselves."""
-        members = [{"node_id": self._node_id, "host": self.host, "port": self.port}]
+        members = [{"node_id": self._node_id, "host": self.advertise_host, "port": self.port}]
         with self._lock:
             for node_id, (host, port) in self._peers.items():
                 members.append({"node_id": node_id, "host": host, "port": port})

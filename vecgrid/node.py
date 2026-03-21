@@ -38,6 +38,8 @@ class LocalPartition:
     role: PartitionRole
     index: HNSWIndex
     version: int = 0  # Incremented on every write for sync tracking
+    is_rebuilding: bool = False
+    rebuild_buffer: Optional[list] = None
 
 
 @dataclass
@@ -411,6 +413,8 @@ class EmbeddedNode:
             "migration_complete": self._handle_migration_complete,
             "migrate_data_push": self._handle_migrate_data_push,
             "size_request": self._handle_size_request,
+            "admin_export": self._handle_admin_export,
+            "admin_rebuild": self._handle_admin_rebuild,
         }
         handler = handlers.get(message.msg_type)
         if handler:
@@ -534,6 +538,8 @@ class EmbeddedNode:
         # Apply to index
         with self._lock:
             lp.index.insert(vid, vector, metadata)
+            if lp.is_rebuilding:
+                lp.rebuild_buffer.append(("insert", vid, vector, metadata))
 
         # Synchronous backup replication
         if self.config.sync_backup and partition.backup_nodes:
@@ -579,6 +585,8 @@ class EmbeddedNode:
             lp = self._partitions[pid]
             lp.index.insert(vid, vector, metadata)
             lp.version += 1
+            if lp.is_rebuilding:
+                lp.rebuild_buffer.append(("insert", vid, vector, metadata))
 
         return Message(msg_type="backup_ack", sender=self.node_id, payload={"ok": True})
 
@@ -647,6 +655,8 @@ class EmbeddedNode:
                 if ok:
                     self._partitions[pid].version += 1
                     version = self._partitions[pid].version
+                    if self._partitions[pid].is_rebuilding:
+                        self._partitions[pid].rebuild_buffer.append(("delete", vid))
 
         if ok:
             self._persist_delete(pid, version, vid)
@@ -673,6 +683,8 @@ class EmbeddedNode:
             if pid in self._partitions:
                 self._partitions[pid].index.delete(vid)
                 self._partitions[pid].version += 1
+                if self._partitions[pid].is_rebuilding:
+                    self._partitions[pid].rebuild_buffer.append(("delete", vid))
 
         return Message(msg_type="backup_ack", sender=self.node_id, payload={"ok": True})
 
@@ -765,6 +777,71 @@ class EmbeddedNode:
 
         return Message(msg_type="migrate_ack", sender=self.node_id, payload={"ok": True})
 
+    def _handle_admin_export(self, msg: Message) -> Message:
+        payload = msg.payload
+        pid = payload["partition_id"]
+        with self._lock:
+            lp = self._partitions.get(pid)
+            if lp and len(lp.index) > 0:
+                vectors = {vid: vec.tolist() for vid, vec in lp.index.vectors.items()}
+                metadata = dict(lp.index.metadata)
+                return Message(
+                    msg_type="admin_export_result",
+                    sender=self.node_id,
+                    payload={"found": True, "vectors": vectors, "metadata": metadata, "version": lp.version}
+                )
+            return Message(msg_type="admin_export_result", sender=self.node_id, payload={"found": False})
+
+    def _handle_admin_rebuild(self, msg: Message) -> Message:
+        payload = msg.payload
+        pid = payload["partition_id"]
+
+        # Validate under lock before spawning a thread
+        with self._lock:
+            lp = self._partitions.get(pid)
+            if not lp:
+                return Message(msg_type="admin_rebuild_ack", sender=self.node_id,
+                               payload={"ok": False, "reason": "partition_not_found"})
+            if lp.is_rebuilding:
+                return Message(msg_type="admin_rebuild_ack", sender=self.node_id,
+                               payload={"ok": False, "reason": "already_rebuilding"})
+            # Mark as rebuilding and initialise buffer while we hold the lock
+            lp.is_rebuilding = True
+            lp.rebuild_buffer = []
+
+        threading.Thread(target=self._async_rebuild_partition, args=(pid,), daemon=True).start()
+        return Message(msg_type="admin_rebuild_ack", sender=self.node_id, payload={"ok": True})
+
+    def _async_rebuild_partition(self, pid: int):
+        # The partition is already marked as rebuilding with an empty buffer
+        # by the caller (_handle_admin_rebuild).
+        with self._lock:
+            lp = self._partitions.get(pid)
+            if not lp or not lp.is_rebuilding:
+                return  # Safety: should not happen, but be defensive
+            old_vectors = list(lp.index.vectors.items())
+            old_metadata = dict(lp.index.metadata)
+        
+        new_index = create_index(dim=self.config.dim, config=self.config.hnsw)
+        for vid, vec in old_vectors:
+            new_index.insert(vid, vec, old_metadata.get(vid, {}))
+            
+        with self._lock:
+            lp = self._partitions.get(pid)
+            if not lp or not lp.is_rebuilding:
+                return
+            for op_tuple in lp.rebuild_buffer:
+                if op_tuple[0] == "insert":
+                    _, vid, vector, meta = op_tuple
+                    new_index.insert(vid, vector, meta)
+                elif op_tuple[0] == "delete":
+                    _, vid = op_tuple
+                    new_index.delete(vid)
+            
+            lp.index = new_index
+            lp.is_rebuilding = False
+            lp.rebuild_buffer = None
+
     def _handle_size_request(self, msg: Message) -> Message:
         """Return local primary vector count."""
         with self._lock:
@@ -810,6 +887,8 @@ class EmbeddedNode:
             # Apply to in-memory index
             with self._lock:
                 lp.index.insert(vector_id, vector, metadata or {})
+                if lp.is_rebuilding:
+                    lp.rebuild_buffer.append(("insert", vector_id, vector, metadata or {}))
 
             # Sync to backups
             if self.config.sync_backup and partition.backup_nodes:
@@ -933,6 +1012,8 @@ class EmbeddedNode:
                     if ok:
                         self._partitions[pid].version += 1
                         version = self._partitions[pid].version
+                        if self._partitions[pid].is_rebuilding:
+                            self._partitions[pid].rebuild_buffer.append(("delete", vector_id))
             if ok:
                 self._persist_delete(pid, version, vector_id)
             if ok and self.config.sync_backup and partition.backup_nodes:

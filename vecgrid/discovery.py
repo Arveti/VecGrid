@@ -77,7 +77,8 @@ class MulticastDiscovery:
                  on_node_discovered: Callable[[NodeInfo], None],
                  multicast_group: str = DEFAULT_MULTICAST_GROUP,
                  multicast_port: int = DEFAULT_MULTICAST_PORT,
-                 broadcast_interval: float = 2.0):
+                 broadcast_interval: float = 2.0,
+                 advertise_host: Optional[str] = None):
         self.node_id = node_id
         self.service_port = service_port
         self.on_node_discovered = on_node_discovered
@@ -90,7 +91,7 @@ class MulticastDiscovery:
         self._recv_thread: Optional[threading.Thread] = None
         self._send_sock: Optional[socket.socket] = None
         self._recv_sock: Optional[socket.socket] = None
-        self._local_ip: str = self._get_local_ip()
+        self._local_ip: str = advertise_host or self._get_local_ip()
 
     def _get_local_ip(self) -> str:
         """Get the local IP that can reach the network."""
@@ -233,7 +234,8 @@ class SeedNodeDiscovery:
     def __init__(self, node_id: str, service_port: int,
                  seeds: list[str],
                  on_node_discovered: Callable[[NodeInfo], None],
-                 poll_interval: float = 5.0):
+                 poll_interval: float = 5.0,
+                 advertise_host: Optional[str] = None):
         self.node_id = node_id
         self.service_port = service_port
         self.seeds = self._parse_seeds(seeds)
@@ -242,7 +244,7 @@ class SeedNodeDiscovery:
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._local_ip = self._get_local_ip()
+        self._local_ip = advertise_host or self._get_local_ip()
 
     @staticmethod
     def _parse_seeds(seeds: list[str]) -> list[tuple[str, int]]:

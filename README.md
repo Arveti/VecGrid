@@ -282,6 +282,41 @@ grid = VecGrid("node-2", dim=384, transport="tcp", port=5701,
 grid.start()
 ```
 
+### VPN / Kubernetes / Cloud Deployment
+
+When nodes communicate across VPNs (Tailscale, WireGuard), overlay networks, or container bridges, the default auto-detected IP may not be reachable by peers. Use `advertise_host` to explicitly set the externally-reachable IP:
+
+```python
+# Tailscale — each node advertises its Tailscale IP
+# Machine A (Tailscale IP: 100.83.53.112)
+grid = VecGrid("node-1", dim=384, transport="tcp", port=5701,
+               discovery="seed", seeds=[],
+               advertise_host="100.8.53.112")
+
+# Machine B (Tailscale IP: 100.64.0.5)
+grid = VecGrid("node-2", dim=384, transport="tcp", port=5701,
+               discovery="seed", seeds=["100.8.53.112:5701"],
+               advertise_host="100.4.0.5")
+```
+
+```python
+# Kubernetes — use the pod IP from the downward API
+import os
+grid = VecGrid("node-1", dim=384, transport="tcp", port=5701,
+               discovery="seed", seeds=["vecgrid-0.vecgrid:5701"],
+               advertise_host=os.environ.get("POD_IP"))
+```
+
+**When do you need `advertise_host`?**
+
+| Environment | Needed? | Why |
+|---|---|---|
+| Same LAN / WiFi | No | Auto-detected IP is reachable |
+| Tailscale / WireGuard | Yes | Default route uses the non-VPN interface |
+| Kubernetes pods | Usually no | Pod IP is the default route; set explicitly for safety |
+| Docker bridge network | Yes | Container IP ≠ host IP |
+| AWS EC2 (same VPC) | No | Private IP is the default route |
+
 ### With Persistence
 
 ```python
@@ -373,6 +408,8 @@ grid = VecGrid(
     transport="tcp",             # "embedded" or "tcp"
     host="0.0.0.0",             # Listen address
     port=5701,                   # Listen port (Hazelcast convention)
+    advertise_host="100.x.x.x", # Externally-reachable IP (for VPNs, K8s, Docker)
+                                 # None = auto-detect via default route
 
     # Discovery
     discovery="multicast",       # "none", "multicast", or "seed"

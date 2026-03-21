@@ -34,6 +34,7 @@ from .discovery import (
     MulticastDiscovery, SeedNodeDiscovery, HeartbeatFailureDetector,
     DiscoveryConfig, NodeInfo,
 )
+from .admin import AdminAPI
 
 __version__ = "0.1.2"
 
@@ -52,6 +53,7 @@ class VecGrid:
                  backup_count: int = 1,
                  transport: str = "embedded",
                  host: str = "0.0.0.0", port: int = 5701,
+                 advertise_host: Optional[str] = None,
                  hnsw_config: Optional[dict] = None,
                  data_dir: Optional[str] = None,
                  snapshot_interval: int = 1000,
@@ -73,6 +75,10 @@ class VecGrid:
             transport: "embedded" for in-process, "tcp" for network
             host: Listen host for TCP transport
             port: Listen port for TCP transport (default 5701, like Hazelcast)
+            advertise_host: Externally-reachable IP to advertise to peers.
+                If None, auto-detects via default route. Set this when using
+                VPNs (e.g. Tailscale) or when the bind address differs from
+                the reachable address.
             hnsw_config: HNSW configuration overrides
             data_dir: Persistence directory (None = pure in-memory)
             snapshot_interval: WAL entries before auto-snapshot
@@ -97,7 +103,8 @@ class VecGrid:
         )
 
         if transport == "tcp":
-            self._transport = TCPTransport(host=host, port=port)
+            self._transport = TCPTransport(host=host, port=port,
+                                          advertise_host=advertise_host)
         else:
             self._transport = InProcessTransport()
 
@@ -110,12 +117,17 @@ class VecGrid:
         self.dim = dim
         self._host = host
         self._port = port
+        
+        # Admin API
+        self.admin = AdminAPI(self)
 
         # Discovery config
         self._discovery_mode = discovery if transport == "tcp" else "none"
         self._seeds = seeds or []
         self._multicast_group = multicast_group
         self._multicast_port = multicast_port
+        self._advertise_host = (advertise_host if transport == "tcp"
+                                else None)
         self._heartbeat_enabled = heartbeat and transport == "tcp"
         self._heartbeat_interval = heartbeat_interval
         self._heartbeat_timeout = heartbeat_timeout
@@ -140,6 +152,7 @@ class VecGrid:
                 on_node_discovered=self._on_peer_discovered,
                 multicast_group=self._multicast_group,
                 multicast_port=self._multicast_port,
+                advertise_host=self._advertise_host,
             )
             self._discovery.start()
 
@@ -149,6 +162,7 @@ class VecGrid:
                 service_port=self._port,
                 seeds=self._seeds,
                 on_node_discovered=self._on_peer_discovered,
+                advertise_host=self._advertise_host,
             )
             self._discovery.start()
 
